@@ -1,0 +1,17 @@
+{
+  "name": "ribosome-vessel",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun src/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@avigopal/ias-executor-ts": "file:../ias-executor-ts"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.0.0",
+    "typescript": "^5.4.0"
+  }
+}
