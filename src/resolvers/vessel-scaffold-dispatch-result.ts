@@ -2,6 +2,8 @@ import type { ResolverResult } from "../types/resolver";
 import { vesselAuthoringScenarioConsumer } from "../composes";
 import type { ComposeDefinition, FsListTaskParams, JsonPathExtractTaskParams, FsReadTaskParams, LlmCompletionDispatchTaskParams, HttpFetchTaskParams } from "../types/compose";
 
+const GOAL_HOST_VESSEL_ENDPOINT = process.env.GOAL_HOST_VESSEL_ENDPOINT ?? "http://127.0.0.1:8210";
+
 interface TaskResultMap {
   [taskId: string]: unknown;
 }
@@ -102,7 +104,7 @@ async function runLlmCompletionDispatch(
     "Respond with ONLY valid JSON, no markdown fences.",
   ].filter(Boolean).join("\n");
 
-  const resp = await fetch("http://127.0.0.1:8210/v2/impulses/resolve", {
+  const resp = await fetch(`${GOAL_HOST_VESSEL_ENDPOINT}/v2/impulses/resolve`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
