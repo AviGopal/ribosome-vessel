@@ -121,6 +121,7 @@ function onTaskCompleted(executionId: string, taskId: string, success: boolean) 
   state.drainTimer = setTimeout(() => {
     const idle = state.activeTasks.size === 0;
     const allSucceeded = state.failedTasks === 0 && state.completedTasks > 0;
+    console.log(`[ribosome-vessel] drain FALLBACK fired for ${executionId} (no execution_completed event arrived) idle=${idle} allSucceeded=${allSucceeded}`);
     if (idle && allSucceeded) {
       dispatchRibosomeExtract(executionId).finally(() => {
         executions.delete(executionId);
@@ -137,7 +138,9 @@ function onTaskCompleted(executionId: string, taskId: string, success: boolean) 
 // 500ms heuristic, decides. Closes ribosome-extraction-gates-on-success-not-reached.
 function onExecutionCompleted(executionId: string, status: string | undefined) {
   const state = getOrCreate(executionId);
+  const hadDrain = state.drainTimer !== null;
   if (state.drainTimer) { clearTimeout(state.drainTimer); state.drainTimer = null; }
+  console.log(`[ribosome-vessel] execution_completed ${executionId} status=${status ?? "?"} completed=${state.completedTasks} failed=${state.failedTasks} (event-driven${hadDrain ? ", pre-empted drain" : ""})`);
   const reached = status !== "failure" && status !== "failed";
   const allSucceeded = state.failedTasks === 0 && state.completedTasks > 0;
   if (reached && allSucceeded) {
