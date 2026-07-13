@@ -136,12 +136,11 @@ function onTaskCompleted(executionId: string, taskId: string, success: boolean) 
 // Gates extraction on reach (status !== "failure") — a hollow completion no
 // longer mints a template — and cancels the drain timer so the event, not the
 // 500ms heuristic, decides. Closes ribosome-extraction-gates-on-success-not-reached.
-function onExecutionCompleted(executionId: string, status: string | undefined) {
+function onExecutionCompleted(executionId: string, reached: boolean, label: string) {
   const state = getOrCreate(executionId);
   const hadDrain = state.drainTimer !== null;
   if (state.drainTimer) { clearTimeout(state.drainTimer); state.drainTimer = null; }
-  console.log(`[ribosome-vessel] execution_completed ${executionId} status=${status ?? "?"} completed=${state.completedTasks} failed=${state.failedTasks} (event-driven${hadDrain ? ", pre-empted drain" : ""})`);
-  const reached = status !== "failure" && status !== "failed";
+  console.log(`[ribosome-vessel] execution_completed ${executionId} reached=${reached} (${label}) completed=${state.completedTasks} failed=${state.failedTasks} (event-driven${hadDrain ? ", pre-empted drain" : ""})`);
   const allSucceeded = state.failedTasks === 0 && state.completedTasks > 0;
   if (reached && allSucceeded) {
     dispatchRibosomeExtract(executionId).finally(() => { executions.delete(executionId); });
@@ -211,9 +210,13 @@ function connectWS() {
       // for executions whose completion event never arrives.
       const data = (msg.data as Record<string, unknown> | undefined) ?? msg;
       const execId = (data.execution_id ?? msg.execution_id) as string | undefined;
+      // activity-api's execution_completed carries success:boolean (not a status
+      // string); fall back to a status field if a future emitter uses one.
+      const success = data.success as boolean | undefined;
       const status = (data.status ?? msg.status) as string | undefined;
+      const reached = success !== undefined ? success === true : (status !== "failure" && status !== "failed");
       if (execId) {
-        onExecutionCompleted(execId, status);
+        onExecutionCompleted(execId, reached, success !== undefined ? `success=${success}` : (status ?? "?"));
       }
     } else if (type === "template_created") {
       // M3: background trace replay for new templates
