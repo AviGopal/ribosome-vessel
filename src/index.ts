@@ -115,7 +115,8 @@ function onTaskCompleted(executionId: string, taskId: string, success: boolean) 
     state.failedTasks++;
   }
 
-  // Reset drain timer: fire extraction 500ms after the last task event
+  // Reset drain timer: FALLBACK only — fires extraction 500ms after the last
+  // task event if no execution_completed event arrives (see onExecutionCompleted)
   if (state.drainTimer) clearTimeout(state.drainTimer);
   state.drainTimer = setTimeout(() => {
     const idle = state.activeTasks.size === 0;
@@ -128,6 +129,22 @@ function onTaskCompleted(executionId: string, taskId: string, success: boolean) 
       executions.delete(executionId);
     }
   }, 500);
+}
+
+// Authoritative completion: fired by activity-api's execution_completed event.
+// Gates extraction on reach (status !== "failure") — a hollow completion no
+// longer mints a template — and cancels the drain timer so the event, not the
+// 500ms heuristic, decides. Closes ribosome-extraction-gates-on-success-not-reached.
+function onExecutionCompleted(executionId: string, status: string | undefined) {
+  const state = getOrCreate(executionId);
+  if (state.drainTimer) { clearTimeout(state.drainTimer); state.drainTimer = null; }
+  const reached = status !== "failure" && status !== "failed";
+  const allSucceeded = state.failedTasks === 0 && state.completedTasks > 0;
+  if (reached && allSucceeded) {
+    dispatchRibosomeExtract(executionId).finally(() => { executions.delete(executionId); });
+  } else {
+    executions.delete(executionId);
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -184,11 +201,16 @@ function connectWS() {
       if (execId && taskId) {
         onTaskCompleted(execId, taskId, success === true);
       }
-    } else if (type === "task.failed") {
-      const execId = msg.execution_id as string | undefined;
-      const taskId = msg.task_id as string | undefined;
-      if (execId && taskId) {
-        onTaskCompleted(execId, taskId, false);
+    } else if (type === "execution_completed" || type === "execution.completed") {
+      // Authoritative completion signal (activity-api emits execution_completed
+      // on the trace-write path; the eventStream poll floor buffers it). This
+      // retires the 500ms drain heuristic — that timer stays only as a fallback
+      // for executions whose completion event never arrives.
+      const data = (msg.data as Record<string, unknown> | undefined) ?? msg;
+      const execId = (data.execution_id ?? msg.execution_id) as string | undefined;
+      const status = (data.status ?? msg.status) as string | undefined;
+      if (execId) {
+        onExecutionCompleted(execId, status);
       }
     } else if (type === "template_created") {
       // M3: background trace replay for new templates
