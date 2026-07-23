@@ -191,15 +191,17 @@ function connectWS() {
     const type = msg.type as string | undefined;
 
     if (type === "task.started") {
-      const execId = msg.execution_id as string | undefined;
-      const taskId = msg.task_id as string | undefined;
+      const data = (msg.data as Record<string, unknown> | undefined) ?? msg;
+      const execId = data.execution_id as string | undefined;
+      const taskId = data.task_id as string | undefined;
       if (execId && taskId) {
         getOrCreate(execId).activeTasks.add(taskId);
       }
     } else if (type === "task.completed") {
-      const execId = msg.execution_id as string | undefined;
-      const taskId = msg.task_id as string | undefined;
-      const success = msg.success as boolean | undefined;
+      const data = (msg.data as Record<string, unknown> | undefined) ?? msg;
+      const execId = data.execution_id as string | undefined;
+      const taskId = data.task_id as string | undefined;
+      const success = data.success as boolean | undefined;
       if (execId && taskId) {
         onTaskCompleted(execId, taskId, success === true);
       }
