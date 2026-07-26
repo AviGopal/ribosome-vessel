@@ -39,8 +39,13 @@ const REPLAY_TRACE_FETCH_LIMIT = parseInt(
   10,
 );
 
+const detailParam = "detail=true";
+
 const LLM_RESOLVER_ENDPOINT =
   process.env.LLM_RESOLVER_VESSEL_ENDPOINT ?? "http://127.0.0.1:8220";
+
+const ACTIVITY_API_ENDPOINT =
+  process.env.ACTIVITY_API_ENDPOINT ?? "http://127.0.0.1:8080";
 
 export interface TemplateCreatedEventData {
   template_id?: string;
@@ -97,7 +102,10 @@ export function parseTemplateCreatedEvent(
     (typeof data.template_id === "string" && data.template_id) ||
     (typeof data.activity_id === "string" && data.activity_id) ||
     null;
-  if (!templateId) return null;
+  if (!templateId) {
+    log.warn("Skipping template due to missing template/activity id");
+    return null;
+  }
   const inputShapes = Array.isArray(data.input_shapes)
     ? data.input_shapes.filter((s): s is string => typeof s === "string")
     : [];
@@ -129,7 +137,10 @@ export function selectReplayTraces(
   inputShapes: string[],
   cap: number,
 ): HistoricalTrace[] {
-  const matching = traces.filter((t) => tracesMatchShapes(t, inputShapes));
+  const recentWindowStart = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString(); // 7 days ago
+  const matching = traces
+    .filter((t) => tracesMatchShapes(t, inputShapes))
+    .filter((t) => (t.executed_at ?? "") >= recentWindowStart);
   return matching.slice(0, cap);
 }
 
@@ -274,7 +285,8 @@ async function callJudge(
   prompt: string,
 ): Promise<string> {
   const f = deps.fetchImpl ?? fetch;
-  const url = (deps.llmEndpoint ?? LLM_RESOLVER_ENDPOINT) + "/resolve";
+  const detailParam = new URLSearchParams({ detail: "full" }).toString();
+  const url = (deps.llmEndpoint ?? LLM_RESOLVER_ENDPOINT) + "/resolve?" + detailParam;
   const res = await f(url, {
     method: "POST",
     headers: {
@@ -372,9 +384,8 @@ export async function runReplayJob(
     try {
       raw = await callJudge(deps, prompt);
     } catch (err) {
-      log.warn("Judge call failed — aborting remaining replays", {
+      log.warn("Judge call failed for trace" + ` ${trace.execution_id} — skipping trace`, {
         templateId,
-        traceId: trace.execution_id,
         error: (err as Error)?.message ?? String(err),
       });
       return {
