@@ -68,11 +68,59 @@ function getOrCreate(executionId: string): ExecutionState {
   return executions.get(executionId)!;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Extraction-route availability gate.
+//
+// The activityDispatch POST below only works if some vessel actually serves the
+// "activityDispatch" shape. activity-api is the trace store, not an executor —
+// it answers use_vessel_discovery for this shape, so every dispatch failed
+// (silently, ~78/hour for weeks) while goal-host's mintReachedTrace already runs
+// the ribosome-extract template in-process on every grounded reach. Probe
+// discovery once (first use, cached for process lifetime) and suppress the
+// dispatch storm with ONE structured line when the route is absent, instead of
+// hammering a wall. Gap: ribosome-extraction-subsumed-by-goalhost-mint-retire-decision.
+// ─────────────────────────────────────────────────────────────────────────────
+let extractRouteAvailable: boolean | null = null; // null = not yet probed
+let extractRouteAbsenceLogged = false;
+
+async function isExtractRouteResolvable(): Promise<boolean> {
+  if (extractRouteAvailable !== null) return extractRouteAvailable;
+  try {
+    const res = await fetch(`${DISCOVERY_ENDPOINT}/resolve`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(API_KEY ? { Authorization: `ApiKey ${API_KEY}` } : {}),
+      },
+      body: JSON.stringify({ pointer: { type: "vesselCapability", shape: "activityDispatch" } }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    const body = await res.json() as { content?: { found?: boolean } };
+    extractRouteAvailable = res.ok && body.content?.found === true;
+  } catch (err: unknown) {
+    // Probe failure (discovery unreachable): stay undecided so a transient
+    // outage does not permanently silence extraction; skip this dispatch only.
+    log.warn("extract-route discovery probe failed:", (err as Error)?.message ?? err);
+    return false;
+  }
+  if (!extractRouteAvailable && !extractRouteAbsenceLogged) {
+    extractRouteAbsenceLogged = true;
+    console.log(JSON.stringify({
+      event: "ribosome_extract_route_unavailable",
+      shape: "activityDispatch",
+      detail: "no vessel serves activityDispatch — extraction dispatch suppressed; goal-host mintReachedTrace performs reach->mint extraction in-process",
+      gap_id: "ribosome-extraction-subsumed-by-goalhost-mint-retire-decision",
+    }));
+  }
+  return extractRouteAvailable;
+}
+
 async function dispatchRibosomeExtract(executionId: string) {
   if (!API_KEY) {
     log.warn("No API key — skipping ribosome extract for", executionId);
     return;
   }
+  if (!(await isExtractRouteResolvable())) return;
   try {
     log.info("Dispatching ribosome-extract for execution", executionId);
     const res = await fetch(`${ACTIVITY_API_ENDPOINT}/v2/impulses/resolve`, {
