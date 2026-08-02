@@ -87,7 +87,48 @@ function getOrCreate(executionId: string): ExecutionState {
 // dispatch surface. Falls back to in-process extraction if goal-host is unreachable.
 const GOAL_HOST_ENDPOINT = process.env.GOAL_HOST_VESSEL_ENDPOINT ?? "http://127.0.0.1:8210";
 
-async function dispatchRibosomeExtract(executionId: string) {
+// Executions already dispatched for extraction. activity-api's execution_completed
+// can arrive more than once for the same execution (WS delivery plus the eventStream
+// poll floor that buffers and replays), and `executions.delete()` in the dispatch
+// `finally` frees the key so a replay re-creates a fresh state and dispatches again.
+// Measured: 334 dispatches over 212 distinct executions in 20 minutes — up to 4x per
+// execution, each one a full template run. Bounded so this cannot grow without limit
+// on a long-lived process.
+const dispatchedExecutions = new Set<string>();
+const DISPATCHED_MAX = 5_000;
+
+function markDispatched(executionId: string): boolean {
+  if (dispatchedExecutions.has(executionId)) return false;
+  if (dispatchedExecutions.size >= DISPATCHED_MAX) {
+    // Drop the oldest ~10% (insertion-ordered) rather than clearing outright, so a
+    // replay arriving right after a wrap does not immediately re-dispatch everything.
+    let toDrop = Math.floor(DISPATCHED_MAX / 10);
+    for (const k of dispatchedExecutions) {
+      dispatchedExecutions.delete(k);
+      if (--toDrop <= 0) break;
+    }
+  }
+  dispatchedExecutions.add(executionId);
+  return true;
+}
+
+interface ExtractLifecycle {
+  executionId: string;
+  status: string;
+  taskCount: number;
+  templateId: string;
+  templateName: string;
+  templateAuthor: string;
+  durationMs: number;
+  costUsd: number;
+  depth: number;
+  impulseCount: number;
+  outputShapes: string[];
+  hasGoalContext: boolean;
+  qualityEligible: boolean;
+}
+
+async function dispatchRibosomeExtract(executionId: string, lifecycle?: ExtractLifecycle) {
   if (!API_KEY) {
     log.warn("No API key — skipping ribosome extract for", executionId);
     return;
@@ -102,7 +143,14 @@ async function dispatchRibosomeExtract(executionId: string) {
       },
       body: JSON.stringify({
         targetTemplateId: "ribosome-extract",
-        variables: { executionId },
+        // ribosome-extract's first task, acquire_trace_signature, is behind a
+        // conditional gate on {{lifecycle.qualityEligible}}. Dispatching with only
+        // executionId leaves that placeholder unresolvable, and the engine fails the
+        // whole chain at task 1 with UNRESOLVABLE_GATE — which is why this template
+        // shows 1000+ executions at a 0% success rate. Its downstream LLM tasks read
+        // the rest of the lifecycle payload too, so send the full object (the same
+        // shape goal-host's mintReachedTrace stamps), not just the gate field.
+        variables: { executionId, ...(lifecycle ? { lifecycle } : {}) },
         tags: ["ribosome-vessel-dispatch"],
       }),
       signal: AbortSignal.timeout(15_000),
@@ -153,6 +201,7 @@ function onExecutionCompleted(
   reached: boolean,
   label: string,
   census?: { taskCount: number; completedTaskCount: number; failedTaskCount: number },
+  meta?: { activityId: string; variantId: string; durationMs: number; costUsd: number },
 ) {
   const state = getOrCreate(executionId);
   const hadDrain = state.drainTimer !== null;
@@ -182,8 +231,44 @@ function onExecutionCompleted(
   const allTerminal = !useCensus || completed === census!.taskCount;
   console.log(`[ribosome-vessel] execution_completed ${executionId} reached=${reached} (${label}) completed=${completed} failed=${failed}${useCensus ? `/${census!.taskCount}` : ""} signal=${source} (event-driven${hadDrain ? ", pre-empted drain" : ""})`);
   const allSucceeded = failed === 0 && completed > 0 && allTerminal;
+
+  // Recursion safety. An extraction run is itself an execution that emits
+  // execution_completed, so without this the ribosome extracts from its own
+  // extractions. The template carries a recursion-safety rule in its LLM rubric, but
+  // that only runs at task 3 — by then the run has already been dispatched, and if an
+  // earlier task fails the rule never evaluates at all. Excluded here, at the source.
+  const producer = (meta?.variantId || meta?.activityId || "").toLowerCase();
+  const isRibosomeFamily = producer.startsWith("ribosome");
+  if (isRibosomeFamily) {
+    console.log(`[ribosome-vessel] skip ${executionId} — recursion safety (producer=${producer})`);
+    executions.delete(executionId);
+    return;
+  }
+
   if (reached && allSucceeded) {
-    dispatchRibosomeExtract(executionId).finally(() => { executions.delete(executionId); });
+    if (!markDispatched(executionId)) {
+      console.log(`[ribosome-vessel] skip ${executionId} — already dispatched for extraction`);
+      executions.delete(executionId);
+      return;
+    }
+    const lifecycle = {
+      executionId,
+      status: "completed",
+      taskCount: useCensus ? census!.taskCount : completed,
+      templateId: meta?.activityId ?? "",
+      templateName: meta?.variantId || meta?.activityId || "",
+      templateAuthor: "",
+      durationMs: meta?.durationMs ?? 0,
+      costUsd: meta?.costUsd ?? 0,
+      depth: 0,
+      impulseCount: 0,
+      outputShapes: [] as string[],
+      hasGoalContext: false,
+      // The execution reached, which is the eligibility signal the template's gate
+      // wants — the same justification goal-host's mintReachedTrace records.
+      qualityEligible: true,
+    };
+    dispatchRibosomeExtract(executionId, lifecycle).finally(() => { executions.delete(executionId); });
   } else {
     executions.delete(executionId);
   }
@@ -274,8 +359,14 @@ function connectWS() {
               failedTaskCount: typeof rawFailedCount === "number" ? rawFailedCount : 0,
             }
           : undefined;
+      const meta = {
+        activityId: String(data.activity_id ?? ""),
+        variantId: String(data.variant_id ?? ""),
+        durationMs: typeof data.duration_ms === "number" ? data.duration_ms : 0,
+        costUsd: typeof data.cost === "number" ? data.cost : 0,
+      };
       if (execId) {
-        onExecutionCompleted(execId, reached, success !== undefined ? `success=${success}` : (status ?? "?"), census);
+        onExecutionCompleted(execId, reached, success !== undefined ? `success=${success}` : (status ?? "?"), census, meta);
       }
     } else if (type === "template_created") {
       // M3: background trace replay for new templates
