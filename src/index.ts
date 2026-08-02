@@ -175,20 +175,31 @@ function onTaskCompleted(executionId: string, taskId: string, success: boolean) 
     state.failedTasks++;
   }
 
-  // Reset drain timer: FALLBACK only — fires extraction 500ms after the last
-  // task event if no execution_completed event arrives (see onExecutionCompleted)
+  // Drain timer: STATE EVICTION ONLY. It used to dispatch ribosome-extract 500ms
+  // after the last task event, as a "fallback for when execution_completed never
+  // arrives". It was never a fallback and it never once worked:
+  //   - 906 of 934 extraction dispatches in a 40-minute window originated here,
+  //     and goal-host failed every single one at task 1 with
+  //     UNRESOLVABLE_GATE {{lifecycle.qualityEligible}}. A 0%-success path.
+  //   - It CANNOT pass that gate: ExecutionState carries only counters, so there
+  //     is no lifecycle to send. Fabricating one is worse than deleting the
+  //     dispatch: qualityEligible=true would convert ~1500 loud failures/hour
+  //     into ~1500 *successful* LLM extractions over executions the census
+  //     deliberately rejected, and false would skip the chain silently.
+  //   - It bypassed markDispatched() and the recursion-safety producer check,
+  //     both of which live only on the event path: 0 dedupe skips observed while
+  //     individual execution ids dispatched up to 4x.
+  //   - It was not covering a gap. 94% of drained ids received an
+  //     execution_completed 0-1s LATER, so it pre-empted and overrode the
+  //     authoritative verdict rather than substituting for a missing one.
+  // Extraction dispatch now lives solely in onExecutionCompleted, which owns the
+  // durable-census gate, markDispatched, and recursion safety. Genuine WS gaps are
+  // covered by lastSeenSequence catchup on reconnect, and goal-host's
+  // mintReachedTrace runs ribosome-extract in-process on grounded reaches
+  // independently of this vessel.
   if (state.drainTimer) clearTimeout(state.drainTimer);
   state.drainTimer = setTimeout(() => {
-    const idle = state.activeTasks.size === 0;
-    const allSucceeded = state.failedTasks === 0 && state.completedTasks > 0;
-    console.log(`[ribosome-vessel] drain FALLBACK fired for ${executionId} (no execution_completed event arrived) idle=${idle} allSucceeded=${allSucceeded}`);
-    if (idle && allSucceeded) {
-      dispatchRibosomeExtract(executionId).finally(() => {
-        executions.delete(executionId);
-      });
-    } else {
-      executions.delete(executionId);
-    }
+    executions.delete(executionId);
   }, 500);
 }
 
