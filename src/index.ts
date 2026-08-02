@@ -275,6 +275,7 @@ function onExecutionCompleted(
       impulseCount: 0,
       outputShapes: [] as string[],
       hasGoalContext: false,
+      goalSignature: null,
       // The execution reached, which is the eligibility signal the template's gate
       // wants — the same justification goal-host's mintReachedTrace records.
       qualityEligible: true,
