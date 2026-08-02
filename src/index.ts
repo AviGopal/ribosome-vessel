@@ -80,74 +80,38 @@ function getOrCreate(executionId: string): ExecutionState {
 // dispatch storm with ONE structured line when the route is absent, instead of
 // hammering a wall. Gap: ribosome-extraction-subsumed-by-goalhost-mint-retire-decision.
 // ─────────────────────────────────────────────────────────────────────────────
-let extractRouteAvailable: boolean | null = null; // null = not yet probed
-let extractRouteAbsenceLogged = false;
-
-async function isExtractRouteResolvable(): Promise<boolean> {
-  if (extractRouteAvailable !== null) return extractRouteAvailable;
-  try {
-    const res = await fetch(`${DISCOVERY_ENDPOINT}/resolve`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        ...(API_KEY ? { Authorization: `ApiKey ${API_KEY}` } : {}),
-      },
-      body: JSON.stringify({ pointer: { type: "vesselCapability", shape: "activityDispatch" } }),
-      signal: AbortSignal.timeout(10_000),
-    });
-    const body = await res.json() as { content?: { found?: boolean } };
-    extractRouteAvailable = res.ok && body.content?.found === true;
-  } catch (err: unknown) {
-    // Probe failure (discovery unreachable): stay undecided so a transient
-    // outage does not permanently silence extraction; skip this dispatch only.
-    log.warn("extract-route discovery probe failed:", (err as Error)?.message ?? err);
-    return false;
-  }
-  if (!extractRouteAvailable && !extractRouteAbsenceLogged) {
-    extractRouteAbsenceLogged = true;
-    console.log(JSON.stringify({
-      event: "ribosome_extract_route_unavailable",
-      shape: "activityDispatch",
-      detail: "no vessel serves activityDispatch — extraction dispatch suppressed; goal-host mintReachedTrace performs reach->mint extraction in-process",
-      gap_id: "ribosome-extraction-subsumed-by-goalhost-mint-retire-decision",
-    }));
-  }
-  return extractRouteAvailable;
-}
+// ── Extraction dispatch via goal-host /run-goal (reach-rate improvement, 2026-08-01)
+// The original approach (POST activityDispatch to activity-api) silently failed because
+// activity-api doesn't serve the activityDispatch shape. Instead, dispatch the ribosome-
+// extract template directly through goal-host's /run-goal endpoint, which IS the standard
+// dispatch surface. Falls back to in-process extraction if goal-host is unreachable.
+const GOAL_HOST_ENDPOINT = process.env.GOAL_HOST_VESSEL_ENDPOINT ?? "http://127.0.0.1:8210";
 
 async function dispatchRibosomeExtract(executionId: string) {
   if (!API_KEY) {
     log.warn("No API key — skipping ribosome extract for", executionId);
     return;
   }
-  if (!(await isExtractRouteResolvable())) return;
   try {
     log.info("Dispatching ribosome-extract for execution", executionId);
-    const res = await fetch(`${ACTIVITY_API_ENDPOINT}/v2/impulses/resolve`, {
+    const res = await fetch(`${GOAL_HOST_ENDPOINT}/run-goal`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         Authorization: `ApiKey ${API_KEY}`,
       },
       body: JSON.stringify({
-        impulse: {
-          pointer: {
-            type: "activityDispatch",
-            templateId: "ribosome-extract",
-            variables: { executionId },
-          },
-        },
+        targetTemplateId: "ribosome-extract",
+        variables: { executionId },
+        tags: ["ribosome-vessel-dispatch"],
       }),
-      signal: AbortSignal.timeout(10_000),
+      signal: AbortSignal.timeout(15_000),
     });
-    const body = await res.json() as { success?: boolean; error?: string };
-    // 202 Accepted is a successful async dispatch; other 2xx requires body.success
-    const isAsyncSuccess = res.status === 202;
-    const isNormalSuccess = res.ok && body.success;
-    if (isAsyncSuccess || isNormalSuccess) {
-      log.info("ribosome-extract dispatched for", executionId);
+    if (res.ok || res.status === 202) {
+      const body = await res.json() as { dispatchId?: string };
+      log.info("ribosome-extract dispatched for", executionId, "dispatchId:", body.dispatchId ?? "(none)");
     } else {
-      log.warn("ribosome-extract dispatch failed:", body.error ?? res.status);
+      log.warn("ribosome-extract dispatch failed:", res.status, await res.text().catch(() => ""));
     }
   } catch (err: unknown) {
     log.warn("ribosome-extract dispatch error:", (err as Error)?.message ?? err);
@@ -184,12 +148,34 @@ function onTaskCompleted(executionId: string, taskId: string, success: boolean) 
 // Gates extraction on reach (status !== "failure") — a hollow completion no
 // longer mints a template — and cancels the drain timer so the event, not the
 // 500ms heuristic, decides. Closes ribosome-extraction-gates-on-success-not-reached.
-function onExecutionCompleted(executionId: string, reached: boolean, label: string) {
+function onExecutionCompleted(
+  executionId: string,
+  reached: boolean,
+  label: string,
+  census?: { taskCount: number; failedTaskCount: number },
+) {
   const state = getOrCreate(executionId);
   const hadDrain = state.drainTimer !== null;
   if (state.drainTimer) { clearTimeout(state.drainTimer); state.drainTimer = null; }
-  console.log(`[ribosome-vessel] execution_completed ${executionId} reached=${reached} (${label}) completed=${state.completedTasks} failed=${state.failedTasks} (event-driven${hadDrain ? ", pre-empted drain" : ""})`);
-  const allSucceeded = state.failedTasks === 0 && state.completedTasks > 0;
+
+  // Which signal decides. The in-memory counters are populated from per-task WS
+  // events (task.started / task.completed), and for the overwhelming majority of
+  // executions those events never arrive at this vessel — getOrCreate() then
+  // hands back a fresh zero-valued state, `completedTasks > 0` is false, and
+  // extraction is skipped for exactly the reached executions worth extracting.
+  // Measured: `reached=true ... completed=0` on almost every line of the journal,
+  // and ZERO ribosome-extract dispatches in 12 hours.
+  //
+  // activity-api's execution_completed now carries the authoritative task census
+  // off the durable trace, so prefer it whenever it is present and non-empty and
+  // fall back to the in-memory counters only when it is absent (an older
+  // activity-api that has not yet converged).
+  const useCensus = census !== undefined && census.taskCount > 0;
+  const source = useCensus ? "durable-census" : "in-memory";
+  const completed = useCensus ? census.taskCount - census.failedTaskCount : state.completedTasks;
+  const failed = useCensus ? census.failedTaskCount : state.failedTasks;
+  console.log(`[ribosome-vessel] execution_completed ${executionId} reached=${reached} (${label}) completed=${completed} failed=${failed} signal=${source} (event-driven${hadDrain ? ", pre-empted drain" : ""})`);
+  const allSucceeded = failed === 0 && completed > 0;
   if (reached && allSucceeded) {
     dispatchRibosomeExtract(executionId).finally(() => { executions.delete(executionId); });
   } else {
@@ -265,8 +251,17 @@ function connectWS() {
       const success = data.success as boolean | undefined;
       const status = (data.status ?? msg.status) as string | undefined;
       const reached = success !== undefined ? success === true : (status !== "failure" && status !== "failed");
+      // Authoritative task census off the durable trace (activity-api 2026-08-02).
+      // Absent on an activity-api that has not converged yet — onExecutionCompleted
+      // falls back to the in-memory counters in that case.
+      const rawTaskCount = data.task_count as number | undefined;
+      const rawFailedCount = data.failed_task_count as number | undefined;
+      const census =
+        typeof rawTaskCount === "number"
+          ? { taskCount: rawTaskCount, failedTaskCount: typeof rawFailedCount === "number" ? rawFailedCount : 0 }
+          : undefined;
       if (execId) {
-        onExecutionCompleted(execId, reached, success !== undefined ? `success=${success}` : (status ?? "?"));
+        onExecutionCompleted(execId, reached, success !== undefined ? `success=${success}` : (status ?? "?"), census);
       }
     } else if (type === "template_created") {
       // M3: background trace replay for new templates
