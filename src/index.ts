@@ -152,7 +152,7 @@ function onExecutionCompleted(
   executionId: string,
   reached: boolean,
   label: string,
-  census?: { taskCount: number; failedTaskCount: number },
+  census?: { taskCount: number; completedTaskCount: number; failedTaskCount: number },
 ) {
   const state = getOrCreate(executionId);
   const hadDrain = state.drainTimer !== null;
@@ -172,10 +172,16 @@ function onExecutionCompleted(
   // activity-api that has not yet converged).
   const useCensus = census !== undefined && census.taskCount > 0;
   const source = useCensus ? "durable-census" : "in-memory";
-  const completed = useCensus ? census.taskCount - census.failedTaskCount : state.completedTasks;
+  const completed = useCensus ? census.completedTaskCount : state.completedTasks;
   const failed = useCensus ? census.failedTaskCount : state.failedTasks;
-  console.log(`[ribosome-vessel] execution_completed ${executionId} reached=${reached} (${label}) completed=${completed} failed=${failed} signal=${source} (event-driven${hadDrain ? ", pre-empted drain" : ""})`);
-  const allSucceeded = failed === 0 && completed > 0;
+  // Every task must be terminal AND successful. Task status is
+  // 'pending' | 'in_progress' | 'completed' | 'failed', so requiring
+  // completed === taskCount is what excludes a run abandoned mid-flight;
+  // `failed === 0` alone would score its non-terminal tasks as fine and
+  // extract a template from a partial execution.
+  const allTerminal = !useCensus || completed === census!.taskCount;
+  console.log(`[ribosome-vessel] execution_completed ${executionId} reached=${reached} (${label}) completed=${completed} failed=${failed}${useCensus ? `/${census!.taskCount}` : ""} signal=${source} (event-driven${hadDrain ? ", pre-empted drain" : ""})`);
+  const allSucceeded = failed === 0 && completed > 0 && allTerminal;
   if (reached && allSucceeded) {
     dispatchRibosomeExtract(executionId).finally(() => { executions.delete(executionId); });
   } else {
@@ -255,10 +261,18 @@ function connectWS() {
       // Absent on an activity-api that has not converged yet — onExecutionCompleted
       // falls back to the in-memory counters in that case.
       const rawTaskCount = data.task_count as number | undefined;
+      const rawCompletedCount = data.completed_task_count as number | undefined;
       const rawFailedCount = data.failed_task_count as number | undefined;
+      // Require completed_task_count too: an activity-api that sends task_count
+      // but not completed_task_count predates the positive count, and guessing
+      // (total - failed) there is exactly the over-counting this avoids.
       const census =
-        typeof rawTaskCount === "number"
-          ? { taskCount: rawTaskCount, failedTaskCount: typeof rawFailedCount === "number" ? rawFailedCount : 0 }
+        typeof rawTaskCount === "number" && typeof rawCompletedCount === "number"
+          ? {
+              taskCount: rawTaskCount,
+              completedTaskCount: rawCompletedCount,
+              failedTaskCount: typeof rawFailedCount === "number" ? rawFailedCount : 0,
+            }
           : undefined;
       if (execId) {
         onExecutionCompleted(execId, reached, success !== undefined ? `success=${success}` : (status ?? "?"), census);
