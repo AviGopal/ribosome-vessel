@@ -268,7 +268,7 @@ async function fetchRecentTraces(
     headers: {
       Authorization: `ApiKey ${deps.apiKey}`,
     },
-    signal: AbortSignal.timeout(15_000),
+    signal: AbortSignal.timeout(60_000),
   });
   if (!res.ok) {
     throw new Error(`fetchRecentTraces HTTP ${res.status}`);
