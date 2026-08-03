@@ -150,7 +150,7 @@ async function dispatchRibosomeExtract(executionId: string, lifecycle?: ExtractL
         // shows 1000+ executions at a 0% success rate. Its downstream LLM tasks read
         // the rest of the lifecycle payload too, so send the full object (the same
         // shape goal-host's mintReachedTrace stamps), not just the gate field.
-        variables: { executionId, ...(lifecycle ? { lifecycle } : {}) },
+        variables: { executionId, applyExtraction: true, ...(lifecycle ? { lifecycle } : {}) },
         tags: ["ribosome-vessel-dispatch"],
       }),
       signal: AbortSignal.timeout(15_000),
