@@ -413,11 +413,20 @@ function connectWS() {
       // for executions whose completion event never arrives.
       const data = (msg.data as Record<string, unknown> | undefined) ?? msg;
       const execId = (data.execution_id ?? msg.execution_id) as string | undefined;
-      // activity-api's execution_completed carries success:boolean (not a status
-      // string); fall back to a status field if a future emitter uses one.
+      // REACH IS NOT EXIT STATUS. `reached` used to be derived here from the event's
+      // success:boolean — the template's exit status. Measured: 20,653 of 20,653
+      // execution_completed events took that branch (19,417 true / 1,236 false, ZERO
+      // fallbacks), yielding 94.0% "reached" on a system whose honest reach is ~13%.
+      // The organ meant to extract templates FROM REACHED EXECUTIONS was extracting on
+      // exit status — the pump that filled the arm pool with uninformed arms.
+      //
+      // The verdict CANNOT be computed at this boundary. activity-api's
+      // execution_completed payload carries execution_id / activity_id / variant_id /
+      // success / the task census / duration / cost — and NO `tags`. classifyReach, the
+      // one honest-reach primitive, reads TAGS ONLY, so re-deriving a local notion of
+      // reach here would fork that primitive (law 3). Enqueue UNGRADED and let the
+      // durable row decide, below.
       const success = data.success as boolean | undefined;
-      const status = (data.status ?? msg.status) as string | undefined;
-      const reached = success !== undefined ? success === true : (status !== "failure" && status !== "failed");
       // Authoritative task census off the durable trace (activity-api 2026-08-02).
       // Absent on an activity-api that has not converged yet — onExecutionCompleted
       // falls back to the in-memory counters in that case.
@@ -442,11 +451,63 @@ function connectWS() {
         costUsd: typeof data.cost === "number" ? data.cost : 0,
       };
       if (execId) {
-        // Fire-and-forget with an explicit rejection guard: onExecutionCompleted is now
-        // async (it resolves the shaped extractionPolicy at use time), and an unhandled
-        // rejection here would take down the WS handler for every subsequent event.
-        void onExecutionCompleted(execId, reached, success !== undefined ? `success=${success}` : (status ?? "?"), census, meta)
-          .catch((err: unknown) => log.warn("onExecutionCompleted failed:", (err as Error)?.message ?? err));
+        const gradeId = execId;
+        // THE RE-READ MUST OUTLAST THE VERDICT, NOT RACE IT. execution_completed is
+        // emitted on the trace-WRITE path, during the walk; goal-host POSTs the reach
+        // verdict only AFTER runGoalSeek returns and the reach gate has run. A single
+        // immediate read is therefore structurally AHEAD of the verdict it waits for:
+        // it would see no reach tag, score every execution 'ungraded', and drive
+        // extraction to ~0% — a silent capability outage dressed up as honesty, and
+        // exactly the failure this vessel's own comments already record ("ZERO
+        // ribosome-extract dispatches in 12 hours").
+        //
+        // So poll with backoff and only give up once the verdict has had time to land.
+        // Re-reading is idempotent and cheap next to an extraction dispatch, and a row
+        // still untagged after the full window is genuinely ungraded — the walk never
+        // produced a verdict — so skipping it is correct rather than merely early.
+        // Waiting also absorbs the reach-patch write-before-insert race (8 of 8 sampled
+        // MATCHED-NO-ROW ids existed on the hub seconds later), which is why a 404 is
+        // treated as "keep waiting" and not as a verdict.
+        void (async () => {
+          const REREAD_BACKOFF_MS = [2_000, 8_000, 20_000, 45_000];
+          let verdict: "reached" | "not-reached" | "ungraded" = "ungraded";
+          let why = "unread";
+          let attempts = 0;
+          for (let i = 0; i <= REREAD_BACKOFF_MS.length; i++) {
+            if (i > 0) await new Promise((r) => setTimeout(r, REREAD_BACKOFF_MS[i - 1]));
+            attempts = i + 1;
+            try {
+              const traceRes = await fetch(
+                `${ACTIVITY_API_ENDPOINT}/v2/activities/execution-traces/${encodeURIComponent(gradeId)}`,
+                {
+                  headers: { ...(API_KEY ? { Authorization: `ApiKey ${API_KEY}` } : {}) },
+                  // Transport deadline, not a behavior gate.
+                  signal: AbortSignal.timeout(15_000),
+                },
+              );
+              if (traceRes.ok) {
+                const row = await traceRes.json() as { tags?: unknown };
+                const tags = Array.isArray(row.tags) ? row.tags.map(String) : [];
+                if (tags.includes("reached:true")) { verdict = "reached"; why = "tag:reached:true"; break; }
+                if (tags.includes("reached:false")) { verdict = "not-reached"; why = "tag:reached:false"; break; }
+                why = tags.length > 0 ? "no-reach-tag" : "no-tags";
+              } else {
+                why = `http-${traceRes.status}`;
+              }
+            } catch (err: unknown) {
+              why = `error:${(err as Error)?.message ?? String(err)}`;
+            }
+          }
+          // Counted so the ROLLBACK TRIGGER is measurable from the journal alone: if
+          // `verdict=reached` stays under ~2% of these lines over an hour of live
+          // traffic, this gate is starving extraction rather than making it honest,
+          // and this change should be reverted rather than tuned.
+          log.info(
+            `reach re-read ${gradeId} verdict=${verdict} (${why}) attempts=${attempts} event_success=${String(success)} —`,
+            verdict === "reached" ? "extraction ALLOWED" : "extraction SKIPPED (not honestly reached)",
+          );
+          await onExecutionCompleted(gradeId, verdict === "reached", `durable:${verdict}/${why}`, census, meta);
+        })().catch((err: unknown) => log.warn("reach re-read failed:", (err as Error)?.message ?? err));
       }
     } else if (type === "template_created") {
       // M3: background trace replay for new templates
