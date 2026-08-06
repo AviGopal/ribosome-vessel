@@ -112,6 +112,83 @@ function markDispatched(executionId: string): boolean {
   return true;
 }
 
+// Shaped-policy resolve (LAW 1), factored out of onExecutionCompleted's inline
+// extractionPolicy read so the eligibility gate reuses it rather than forking it.
+// Resolves through DISCOVERY, never activity-api: activity-api's /v2/impulses/resolve
+// switches on pointer.type and its default branch returns 404 `use_vessel_discovery`
+// for any shape it does not itself store. Discovery's universal proxy forwards a
+// non-discovery shape to its registered producer and takes a FLAT { pointer } body.
+// Returns null on ANY failure — every caller must supply an allow-biased fallback,
+// because null is the COMMON case: extractionPolicy resolved 0 of 1446 times in 6h.
+async function resolveShapedPolicy(shapeType: string): Promise<Record<string, unknown> | null> {
+  try {
+    const res = await fetch(`${DISCOVERY_ENDPOINT}/resolve`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(API_KEY ? { Authorization: `ApiKey ${API_KEY}` } : {}),
+      },
+      body: JSON.stringify({ pointer: { type: shapeType } }),
+      signal: AbortSignal.timeout(5_000),
+    });
+    if (!res.ok) return null;
+    const j = (await res.json()) as Record<string, unknown>;
+    // A direct vessel resolve returns { body: {...} }; federated egress nests it under
+    // { content: { value | content | body } }. Probe both envelopes.
+    const c = j.content as Record<string, unknown> | undefined;
+    return ((j.body ?? (c && typeof c === "object" ? (c.body ?? c.value ?? c) : undefined) ?? j) ?? {}) as Record<string, unknown>;
+  } catch (err: unknown) {
+    log.warn(`${shapeType} resolve error:`, (err as Error)?.message ?? err);
+    return null;
+  }
+}
+
+// NOT EXHAUSTIVE, AND KNOWN NOT TO BE. ias-executor-ts/src/templates/lifecycle/ holds
+// SIX meta-templates (validator-dispatch, slot-binding, ribosome-extract,
+// audit-test-report, debug-failing-audit, run-sensitivity-probe); all carry
+// category:"meta" and five carry a `subscription`. Only these two are listed because
+// only these two are measured high-volume-and-never-graded: 540 of 700 sampled hub
+// rows, 0 of which ever carried a reached:* tag. The other four are left to the
+// re-read on purpose — over-dropping is the unrecoverable direction.
+// The list is a NAME list because the structural marker is not on the wire:
+// activity-api's execution_completed (execution-traces.ts:3288-3289) emits
+// activity_id/variant_id/success/census/duration/cost and NOTHING ELSE. Emitting
+// `category` there is the durable fix and the standing demand this warn line records.
+const UNGRADABLE_PRODUCERS_FALLBACK: readonly string[] = Object.freeze([
+  "validator-dispatch",
+  "slot-binding",
+]);
+const ELIGIBILITY_TTL_MS = 300_000;
+let eligibilityCache: { list: readonly string[]; source: string; at: number } | null = null;
+
+// TTL-CACHED, not per-event. The naive form awaits a discovery POST on every
+// execution_completed — ~1476 per 6h, every one a guaranteed 404 (the registry serves
+// llmModelPolicy / docFixPolicy / learningPolicy / repairPolicy and no extraction*),
+// DOUBLING this vessel's dead policy traffic and putting a 5s transport deadline in
+// front of a two-element string comparison. Caching keeps the law-1 read (a minted
+// policy still widens the list within one TTL) at ~1 call per 5 min. Same discipline
+// the extraction-route probe at :70-81 already uses ("probe once, cache for lifetime").
+// Only a NON-EMPTY array of strings may replace the literal: an empty array would mean
+// "drop nothing", and a malformed one must never be able to mean "drop everything".
+async function ungradableProducers(): Promise<{ list: readonly string[]; source: string }> {
+  const now = Date.now();
+  if (eligibilityCache && now - eligibilityCache.at < ELIGIBILITY_TTL_MS) return eligibilityCache;
+  let list = UNGRADABLE_PRODUCERS_FALLBACK;
+  let source = "fallback-literal";
+  const pol = await resolveShapedPolicy("extractionEligibilityPolicy");
+  const raw = pol?.ungradableProducers;
+  if (Array.isArray(raw) && raw.length > 0 && raw.every((x) => typeof x === "string")) {
+    list = (raw as string[]).map((x) => x.toLowerCase());
+    source = "extractionEligibilityPolicy";
+  } else {
+    log.warn(
+      `extractionEligibilityPolicy unresolved — falling back to literal [${UNGRADABLE_PRODUCERS_FALLBACK.join(", ")}]; three further lifecycle meta-templates exist unlisted (audit-test-report, debug-failing-audit, run-sensitivity-probe)`,
+    );
+  }
+  eligibilityCache = { list, source, at: now };
+  return eligibilityCache;
+}
+
 interface ExtractLifecycle {
   executionId: string;
   status: string;
@@ -286,30 +363,15 @@ async function onExecutionCompleted(
   const extractionDepth = (producer.match(/learned-/g) ?? []).length;
   let maxExtractionDepth = 1;
   let depthPolicySource = "fallback-literal";
-  try {
-    const polRes = await fetch(`${DISCOVERY_ENDPOINT}/resolve`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        ...(API_KEY ? { Authorization: `ApiKey ${API_KEY}` } : {}),
-      },
-      body: JSON.stringify({ pointer: { type: "extractionPolicy" } }),
-      signal: AbortSignal.timeout(5_000),
-    });
-    if (polRes.ok) {
-      const j = (await polRes.json()) as Record<string, unknown>;
-      // A direct vessel resolve returns { body: {...} }; federated egress nests it under
-      // { content: { value | content | body } }. Probe both envelopes.
-      const c = j.content as Record<string, unknown> | undefined;
-      const policy = ((j.body ?? (c && typeof c === "object" ? (c.body ?? c.value ?? c) : undefined) ?? j) ?? {}) as Record<string, unknown>;
-      const v = policy.maxExtractionDepth;
-      if (typeof v === "number" && Number.isFinite(v) && v >= 0) {
-        maxExtractionDepth = v;
-        depthPolicySource = "extractionPolicy";
-      }
+  {
+    // Reuses the shared resolveShapedPolicy helper rather than forking a second copy
+    // of the discovery/envelope logic — the guard below is unchanged.
+    const policy = await resolveShapedPolicy("extractionPolicy");
+    const v = policy?.maxExtractionDepth;
+    if (typeof v === "number" && Number.isFinite(v) && v >= 0) {
+      maxExtractionDepth = v;
+      depthPolicySource = "extractionPolicy";
     }
-  } catch (err: unknown) {
-    log.warn("extractionPolicy resolve error:", (err as Error)?.message ?? err);
   }
   if (depthPolicySource === "fallback-literal") {
     log.warn("extractionPolicy unresolved — falling back to maxExtractionDepth", maxExtractionDepth);
@@ -469,6 +531,48 @@ function connectWS() {
         // MATCHED-NO-ROW ids existed on the hub seconds later), which is why a 404 is
         // treated as "keep waiting" and not as a verdict.
         void (async () => {
+          // GRADABILITY GATE — RUNS BEFORE THE RE-READ, ON THE EVENT ALONE.
+          //
+          // WHAT THIS BUYS, STATED HONESTLY: COST, NOT HONESTY AND NOT REACH.
+          // Extraction output is UNCHANGED by this gate. A lifecycle row today scores
+          // verdict=ungraded, reaches onExecutionCompleted with reached=false, and falls
+          // to the no-dispatch else branch — no extraction. After this gate: also no
+          // extraction. Measured 31 ribosome-extract dispatches per 6h, invariant across
+          // the change. What is saved is ~982 re-reads per 6h x 5 hub GETs each
+          // (~4,900 GETs) and ~982 concurrently-held 75s closures.
+          //
+          // MEASURED SHARE (700 hub rows, 2026-08-06T07:13-10:41Z; 1476 journal re-reads,
+          // 774 of them resolvable against that sample): validator-dispatch + slot-binding
+          // are 515 of 721 UNGRADED re-reads (71.4%) and 515 of 774 total (66.5%). They
+          // are 540 of 700 trace rows. ZERO of those 540 ever carried a reached:* tag and
+          // ZERO of the 515 produced any verdict; every reach-tagged row in the sample
+          // (23 false / 7 true) was a non-lifecycle producer. 1447 of 1476 ungraded
+          // re-reads burned all 5 attempts to learn what the template id already said.
+          //
+          // ALLOW-BIASED, deliberately, exactly as the depth bound is. An unresolvable
+          // policy, an empty or wrong-typed field, or unreachable discovery leaves the two
+          // literals in place — it must never widen into "drop unless allow-listed", which
+          // would read from the journal as perfect honesty while extracting nothing.
+          //
+          // EQUALITY, not substring. Real rows carry the bare id for exactly these two
+          // (450 `validator-dispatch`, 90 `slot-binding`) while every other template's
+          // variant_id is the record-id form `activity:⟨name⟩` — substring would swallow
+          // a learned template whose name merely contains the marker. An empty producer
+          // never matches, so a malformed event falls through to the re-read (safe).
+          const producerId = (meta.variantId || meta.activityId || "").toLowerCase();
+          const { list: ungradable, source: eligibilitySource } = await ungradableProducers();
+          if (producerId && ungradable.includes(producerId)) {
+            // Clear the drain timer first: onExecutionCompleted does this before every
+            // one of its early returns, and this gate bypasses that path entirely.
+            const st = executions.get(gradeId);
+            if (st?.drainTimer) { clearTimeout(st.drainTimer); st.drainTimer = null; }
+            log.info(
+              `skip ${gradeId} — ungradable producer (producer=${producerId}, policy=${eligibilitySource}) — re-read avoided`,
+            );
+            executions.delete(gradeId);
+            return;
+          }
+
           const REREAD_BACKOFF_MS = [2_000, 8_000, 20_000, 45_000];
           let verdict: "reached" | "not-reached" | "ungraded" = "ungraded";
           let why = "unread";
@@ -498,10 +602,22 @@ function connectWS() {
               why = `error:${(err as Error)?.message ?? String(err)}`;
             }
           }
-          // Counted so the ROLLBACK TRIGGER is measurable from the journal alone: if
-          // `verdict=reached` stays under ~2% of these lines over an hour of live
-          // traffic, this gate is starving extraction rather than making it honest,
-          // and this change should be reverted rather than tuned.
+          // ROLLBACK TRIGGER — ABSOLUTE, NOT A RATIO. This was formerly "if
+          // verdict=reached stays under ~2% of these lines, revert". That threshold is
+          // dead: it read 1.22% (18 reached / 1476 re-reads per 6h) — ALREADY TRIPPED,
+          // never acted on — and the gradability gate above lifts it to ~3.6% purely by
+          // removing ~982 ungradable rows from the DENOMINATOR, with zero change to the
+          // numerator. A gate that clears its own rollback trigger by shrinking the
+          // denominator is a gamed metric, so the trigger is now stated in units this
+          // filter cannot move: EXTRACTION DISPATCHES PER 6H, baseline 31 (measured
+          // 2026-08-06 over the same 1476-re-read window). If `Dispatching
+          // ribosome-extract` falls below ~25/6h, this gate is starving extraction and
+          // should be reverted rather than tuned.
+          //
+          // Direct over-drop probe: any `ungradable producer` skip line whose execution
+          // id, resolved on the hub 10+ minutes later, carries a reached:* tag. Expected
+          // count is exactly ZERO (0 of 540 sampled lifecycle rows, 0 of 515 lifecycle
+          // re-reads), so a SINGLE occurrence falsifies the filter's premise.
           log.info(
             `reach re-read ${gradeId} verdict=${verdict} (${why}) attempts=${attempts} event_success=${String(success)} —`,
             verdict === "reached" ? "extraction ALLOWED" : "extraction SKIPPED (not honestly reached)",
