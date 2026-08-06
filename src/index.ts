@@ -207,7 +207,7 @@ function onTaskCompleted(executionId: string, taskId: string, success: boolean) 
 // Gates extraction on reach (status !== "failure") — a hollow completion no
 // longer mints a template — and cancels the drain timer so the event, not the
 // 500ms heuristic, decides. Closes ribosome-extraction-gates-on-success-not-reached.
-function onExecutionCompleted(
+async function onExecutionCompleted(
   executionId: string,
   reached: boolean,
   label: string,
@@ -248,10 +248,74 @@ function onExecutionCompleted(
   // extractions. The template carries a recursion-safety rule in its LLM rubric, but
   // that only runs at task 3 — by then the run has already been dispatched, and if an
   // earlier task fails the rule never evaluates at all. Excluded here, at the source.
+  // KEEP the prefix rejection (it still catches a producer that literally carries no
+  // lineage marker) and ADD an extraction-DEPTH bound on the lineage marker. The prefix
+  // test alone never fired on the ribosome's own descendants: extracted templates are
+  // minted as `learned-…`, NOT `ribosome…`, so the vessel's own output was a legal
+  // extraction source on the next generation. The live store shows the result —
+  // `learned-report-top-failures-24h-proof-` x21, `…-improved-` x21, and ids of the form
+  // `learned-learned-learned-auto-bridge-shellresult` that a live walk actually SELECTED.
+  // Each generation is a further remove from any real execution.
+  //
+  // Reused marker: `learned-` is the ribosome's own deterministic mint prefix, so the
+  // number of its occurrences in the producer id IS the generation counter. Extracted
+  // templates carry metadata.extracted / metadata.extractedFrom but no depth field, and
+  // this vessel receives only the producer id on the event — the id is the only lineage
+  // signal available at use time. An id with no marker reads as depth 0 and is ALLOWED:
+  // biasing toward blocking unmarked producers would block every ordinary non-extracted
+  // execution and freeze extraction outright, the same silent capability outage as the
+  // 12-hour zero-dispatch window noted above. Over-allowing costs at most one further
+  // generation, which this same bound then stops.
   const producer = (meta?.variantId || meta?.activityId || "").toLowerCase();
   const isRibosomeFamily = producer.startsWith("ribosome");
   if (isRibosomeFamily) {
     console.log(`[ribosome-vessel] skip ${executionId} — recursion safety (producer=${producer})`);
+    executions.delete(executionId);
+    return;
+  }
+  // LAW 1: the bound is behavior, so it is read at USE TIME from the shaped
+  // `extractionPolicy` impulse rather than frozen as a constant. It resolves through
+  // DISCOVERY, not activity-api: activity-api's /v2/impulses/resolve switches on
+  // pointer.type and its default branch returns 404 `use_vessel_discovery` for any shape
+  // it does not itself store, so an extractionPolicy read there could never resolve and
+  // the "shaped" policy would be decorative. Discovery's universal proxy forwards any
+  // non-discovery shape to its registered producer and takes a FLAT { pointer } body.
+  // The literal below applies ONLY when the resolve fails, and that fallback is LOGGED so
+  // a missing policy producer is visible in the journal instead of silently becoming the
+  // policy — which also makes the log line the standing demand signal for minting one.
+  const extractionDepth = (producer.match(/learned-/g) ?? []).length;
+  let maxExtractionDepth = 1;
+  let depthPolicySource = "fallback-literal";
+  try {
+    const polRes = await fetch(`${DISCOVERY_ENDPOINT}/resolve`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(API_KEY ? { Authorization: `ApiKey ${API_KEY}` } : {}),
+      },
+      body: JSON.stringify({ pointer: { type: "extractionPolicy" } }),
+      signal: AbortSignal.timeout(5_000),
+    });
+    if (polRes.ok) {
+      const j = (await polRes.json()) as Record<string, unknown>;
+      // A direct vessel resolve returns { body: {...} }; federated egress nests it under
+      // { content: { value | content | body } }. Probe both envelopes.
+      const c = j.content as Record<string, unknown> | undefined;
+      const policy = ((j.body ?? (c && typeof c === "object" ? (c.body ?? c.value ?? c) : undefined) ?? j) ?? {}) as Record<string, unknown>;
+      const v = policy.maxExtractionDepth;
+      if (typeof v === "number" && Number.isFinite(v) && v >= 0) {
+        maxExtractionDepth = v;
+        depthPolicySource = "extractionPolicy";
+      }
+    }
+  } catch (err: unknown) {
+    log.warn("extractionPolicy resolve error:", (err as Error)?.message ?? err);
+  }
+  if (depthPolicySource === "fallback-literal") {
+    log.warn("extractionPolicy unresolved — falling back to maxExtractionDepth", maxExtractionDepth);
+  }
+  if (extractionDepth > maxExtractionDepth) {
+    console.log(`[ribosome-vessel] skip ${executionId} — extraction depth ${extractionDepth} > ${maxExtractionDepth} (producer=${producer}, policy=${depthPolicySource})`);
     executions.delete(executionId);
     return;
   }
@@ -378,7 +442,11 @@ function connectWS() {
         costUsd: typeof data.cost === "number" ? data.cost : 0,
       };
       if (execId) {
-        onExecutionCompleted(execId, reached, success !== undefined ? `success=${success}` : (status ?? "?"), census, meta);
+        // Fire-and-forget with an explicit rejection guard: onExecutionCompleted is now
+        // async (it resolves the shaped extractionPolicy at use time), and an unhandled
+        // rejection here would take down the WS handler for every subsequent event.
+        void onExecutionCompleted(execId, reached, success !== undefined ? `success=${success}` : (status ?? "?"), census, meta)
+          .catch((err: unknown) => log.warn("onExecutionCompleted failed:", (err as Error)?.message ?? err));
       }
     } else if (type === "template_created") {
       // M3: background trace replay for new templates
