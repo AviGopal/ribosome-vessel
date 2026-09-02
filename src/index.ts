@@ -426,6 +426,45 @@ const replayDeps: ReplayObserverDeps = {
   llmEndpoint: process.env.LLM_RESOLVER_VESSEL_ENDPOINT ?? "http://127.0.0.1:8220",
 };
 
+/**
+ * The reach verdict for a durable trace row. PURE — extracted so the three-state
+ * behaviour can be pinned by a test; it was inline in the re-read loop and unassertable.
+ *
+ * READS THE COLUMN, NOT THE TAGS. `reached` is the verdict of record — an option<bool>
+ * on `execution` that goal-host patches once the walk grades itself. Until 2026-09-02
+ * the compat view did not PROJECT it, so this endpoint carried no such field and the
+ * only reach signal reachable here was a `reached:*` string in `tags`. This loop
+ * string-matched out of absence, not preference.
+ *
+ * Tags are caller-written and incomplete. From this vessel's own measurements: of 700
+ * hub rows sampled, 540 were validator-dispatch / slot-binding and ZERO carried a
+ * reached:* tag; the re-read loop scored 18 reached per 1476 re-reads (1.22%) on a fleet
+ * whose honest reach is ~13%. The organ that extracts templates FROM REACHED EXECUTIONS
+ * was starved by a read-path gap, not by a shortage of reached executions.
+ *
+ * THREE-STATE, and the third state is load-bearing. `null` means NEVER GRADED, not
+ * "did not reach". Treating null as not-reached would brand every ungraded row a
+ * failure — a worse version of the bug this replaces.
+ *
+ * TAGS REMAIN A FALLBACK, deliberately: an activity-api predating the projection fix
+ * returns no `reached` key, and dropping the tag path would blind this vessel against
+ * an older peer mid-rolling-deploy. Allow-biased, like the gradability gate.
+ */
+export function reachVerdictFromTraceRow(
+  row: { tags?: unknown; reached?: unknown },
+): { verdict: "reached" | "not-reached" | null; why: string } {
+  const reachedField = row.reached;
+  if (reachedField === true) return { verdict: "reached", why: "column:reached=true" };
+  if (reachedField === false) return { verdict: "not-reached", why: "column:reached=false" };
+  const tags = Array.isArray(row.tags) ? row.tags.map(String) : [];
+  if (tags.includes("reached:true")) return { verdict: "reached", why: "tag:reached:true" };
+  if (tags.includes("reached:false")) return { verdict: "not-reached", why: "tag:reached:false" };
+  return {
+    verdict: null,
+    why: reachedField === null ? "column-null-ungraded" : tags.length > 0 ? "no-reach-tag" : "no-tags",
+  };
+}
+
 function connectWS() {
   log.info("Connecting to activity-api WebSocket:", WS_URL);
   ws = new WebSocket(WS_URL);
@@ -590,11 +629,10 @@ function connectWS() {
                 },
               );
               if (traceRes.ok) {
-                const row = await traceRes.json() as { tags?: unknown };
-                const tags = Array.isArray(row.tags) ? row.tags.map(String) : [];
-                if (tags.includes("reached:true")) { verdict = "reached"; why = "tag:reached:true"; break; }
-                if (tags.includes("reached:false")) { verdict = "not-reached"; why = "tag:reached:false"; break; }
-                why = tags.length > 0 ? "no-reach-tag" : "no-tags";
+                const row = await traceRes.json() as { tags?: unknown; reached?: unknown };
+                const d = reachVerdictFromTraceRow(row);
+                why = d.why;
+                if (d.verdict !== null) { verdict = d.verdict; break; }
               } else {
                 why = `http-${traceRes.status}`;
               }
