@@ -454,35 +454,9 @@ export function reachVerdictFromTraceRow(
   row: { tags?: unknown; reached?: unknown },
 ): { verdict: "reached" | "not-reached" | null; why: string } {
   const reachedField = row.reached;
-  const tagsEarly = Array.isArray(row.tags) ? row.tags.map(String) : [];
   if (reachedField === true) return { verdict: "reached", why: "column:reached=true" };
-  if (reachedField === false) {
-    // SELF-CONTRADICTING ROW — reversal of this function's original rule (same day).
-    //
-    // The rule was "the column is the verdict of record; if they disagree the column
-    // wins." Measured 2026-09-02, walk-satisfier-1-1788364637686 — the goal "count the
-    // .ts files under repos/ribosome-vessel/src", answer 7, INDEPENDENTLY verified by a
-    // host-side recount — carries in the live store, simultaneously:
-    //
-    //     status = success     tags = ["reached:true"]     reached = False
-    //
-    // `reached:true` comes from goal-host's GRADE-AT-INSERT path: written locally and
-    // synchronously from the walk's own verdict. The column is derived at ingest and can
-    // be written before that verdict exists — measured reach-patch lag runs to 586s. So on
-    // this disagreement the TAG is the later, better-informed value, and the old rule made
-    // this vessel discard a genuinely reached execution, starving the extraction it exists
-    // to perform.
-    //
-    // ONE-DIRECTIONAL on purpose: only this lossy direction is overridden. It cannot
-    // manufacture a false reach, because the tag carries the same verdict the patch itself
-    // would have written. The `why` names the contradiction so the WRITE-side defect stays
-    // visible in the journal rather than being silently papered over here.
-    if (tagsEarly.includes("reached:true")) {
-      return { verdict: "reached", why: "contradiction:column=false/tag=reached:true — trusting grade-at-insert tag" };
-    }
-    return { verdict: "not-reached", why: "column:reached=false" };
-  }
-  const tags = tagsEarly;
+  if (reachedField === false) return { verdict: "not-reached", why: "column:reached=false" };
+  const tags = Array.isArray(row.tags) ? row.tags.map(String) : [];
   if (tags.includes("reached:true")) return { verdict: "reached", why: "tag:reached:true" };
   if (tags.includes("reached:false")) return { verdict: "not-reached", why: "tag:reached:false" };
   return {
