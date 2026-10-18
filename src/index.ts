@@ -200,7 +200,7 @@ async function ungradableProducers(): Promise<{ list: readonly string[]; source:
   return eligibilityCache;
 }
 
-interface ExtractLifecycle {
+export interface ExtractLifecycle {
   executionId: string;
   status: string;
   taskCount: number;
@@ -216,6 +216,42 @@ interface ExtractLifecycle {
   qualityEligible: boolean;
 }
 
+/**
+ * The /run-goal body for one extraction. Pure, so a test can pin it.
+ *
+ * It DECLARES ITS PRODUCT. goal-host's write door runs a store write on a dispatch not
+ * admitted as a change only when that write is the dispatch's own product (one of its
+ * expected_output_shapes). The extraction exists to write the template it synthesizes,
+ * through task 5 (dispatch_write_attempt: impulse-resolve -> activityTemplate_write). Sent
+ * with no expected_output_shapes, that write was nobody's product, so the executor skipped
+ * it as write_door_not_admitted on every run and nothing was persisted.
+ * activityTemplate_write is a store write, not a change shape, so declaring it admits no
+ * change; it names what this run is for.
+ *
+ * It sends NO goal text, on purpose. With a goal, goal-host grades the pinned run through
+ * its goal-reach gate and, for this goal class, the LLM judge: a judge call per extraction,
+ * a beta penalty on ribosome-extract when it says no, and a goal-path row per execution id.
+ * Without one, the run is graded declaratively (the template's output_shapes against what
+ * it produced); goal-host's own reach->mint extraction keeps clear of that gate the same way,
+ * by sending no goal text. The pinned targetTemplateId
+ * keeps the dispatch on goal-host's recovery loop (no edit-intent route, no inference).
+ */
+export function ribosomeExtractBody(executionId: string, lifecycle?: ExtractLifecycle) {
+  return {
+    expected_output_shapes: ["activityTemplate_write"],
+    targetTemplateId: "ribosome-extract",
+    // ribosome-extract's first task, acquire_trace_signature, is behind a
+    // conditional gate on {{lifecycle.qualityEligible}}. Dispatching with only
+    // executionId leaves that placeholder unresolvable, and the engine fails the
+    // whole chain at task 1 with UNRESOLVABLE_GATE — which is why this template
+    // shows 1000+ executions at a 0% success rate. Its downstream LLM tasks read
+    // the rest of the lifecycle payload too, so send the full object (the same
+    // shape goal-host's mintReachedTrace stamps), not just the gate field.
+    variables: { executionId, applyExtraction: true, ...(lifecycle ? { lifecycle } : {}) },
+    tags: ["ribosome-vessel-dispatch"],
+  };
+}
+
 async function dispatchRibosomeExtract(executionId: string, lifecycle?: ExtractLifecycle) {
   if (!API_KEY) {
     log.warn("No API key — skipping ribosome extract for", executionId);
@@ -229,18 +265,7 @@ async function dispatchRibosomeExtract(executionId: string, lifecycle?: ExtractL
         "Content-Type": "application/json",
         Authorization: `ApiKey ${API_KEY}`,
       },
-      body: JSON.stringify({
-        targetTemplateId: "ribosome-extract",
-        // ribosome-extract's first task, acquire_trace_signature, is behind a
-        // conditional gate on {{lifecycle.qualityEligible}}. Dispatching with only
-        // executionId leaves that placeholder unresolvable, and the engine fails the
-        // whole chain at task 1 with UNRESOLVABLE_GATE — which is why this template
-        // shows 1000+ executions at a 0% success rate. Its downstream LLM tasks read
-        // the rest of the lifecycle payload too, so send the full object (the same
-        // shape goal-host's mintReachedTrace stamps), not just the gate field.
-        variables: { executionId, applyExtraction: true, ...(lifecycle ? { lifecycle } : {}) },
-        tags: ["ribosome-vessel-dispatch"],
-      }),
+      body: JSON.stringify(ribosomeExtractBody(executionId, lifecycle)),
       signal: AbortSignal.timeout(15_000),
     });
     if (res.ok || res.status === 202) {
