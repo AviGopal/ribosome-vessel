@@ -15,6 +15,7 @@
 
 import { DiscoveryRegistrationLoop } from "@avigopal/ias-executor-ts";
 import { onTemplateCreated, type ReplayObserverDeps } from "./replay-observer";
+import { SkipCounters, skipRulesFromPolicy, skipTagRule, trivialTaskCountSkip, type SkipRules } from "./extraction-eligibility";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Config
@@ -159,7 +160,9 @@ const UNGRADABLE_PRODUCERS_FALLBACK: readonly string[] = Object.freeze([
   "slot-binding",
 ]);
 const ELIGIBILITY_TTL_MS = 300_000;
-let eligibilityCache: { list: readonly string[]; source: string; at: number } | null = null;
+let eligibilityCache: { list: readonly string[]; source: string; rules: SkipRules; at: number } | null = null;
+// Extraction skips by reason (trivial task count, probe/observe tag), served on /health.
+const extractionSkips = new SkipCounters();
 
 // TTL-CACHED, not per-event. The naive form awaits a discovery POST on every
 // execution_completed — ~1476 per 6h, every one a guaranteed 404 (the registry serves
@@ -170,7 +173,9 @@ let eligibilityCache: { list: readonly string[]; source: string; at: number } | 
 // the extraction-route probe at :70-81 already uses ("probe once, cache for lifetime").
 // Only a NON-EMPTY array of strings may replace the literal: an empty array would mean
 // "drop nothing", and a malformed one must never be able to mean "drop everything".
-async function ungradableProducers(): Promise<{ list: readonly string[]; source: string }> {
+// The same policy read also carries the trivial-task-count and probe/observe-tag skip
+// rules (extraction-eligibility.ts), so they share this one cached resolve.
+async function ungradableProducers(): Promise<{ list: readonly string[]; source: string; rules: SkipRules }> {
   const now = Date.now();
   if (eligibilityCache && now - eligibilityCache.at < ELIGIBILITY_TTL_MS) return eligibilityCache;
   let list = UNGRADABLE_PRODUCERS_FALLBACK;
@@ -185,7 +190,13 @@ async function ungradableProducers(): Promise<{ list: readonly string[]; source:
       `extractionEligibilityPolicy unresolved — falling back to literal [${UNGRADABLE_PRODUCERS_FALLBACK.join(", ")}]; three further lifecycle meta-templates exist unlisted (audit-test-report, debug-failing-audit, run-sensitivity-probe)`,
     );
   }
-  eligibilityCache = { list, source, at: now };
+  const rules = skipRulesFromPolicy(pol);
+  if (rules.fallbacks.length > 0) {
+    log.warn(
+      `extractionEligibilityPolicy has no valid ${rules.fallbacks.join(", ")} — skip rules fall back to minTaskCount=${rules.minTaskCount}, skipTags=[${rules.skipTags.join(", ")}], skipTagPrefixes=[${rules.skipTagPrefixes.join(", ")}]`,
+    );
+  }
+  eligibilityCache = { list, source, rules, at: now };
   return eligibilityCache;
 }
 
@@ -599,7 +610,7 @@ function connectWS() {
           // a learned template whose name merely contains the marker. An empty producer
           // never matches, so a malformed event falls through to the re-read (safe).
           const producerId = (meta.variantId || meta.activityId || "").toLowerCase();
-          const { list: ungradable, source: eligibilitySource } = await ungradableProducers();
+          const { list: ungradable, source: eligibilitySource, rules: skipRules } = await ungradableProducers();
           if (producerId && ungradable.includes(producerId)) {
             // Clear the drain timer first: onExecutionCompleted does this before every
             // one of its early returns, and this gate bypasses that path entirely.
@@ -611,11 +622,25 @@ function connectWS() {
             executions.delete(gradeId);
             return;
           }
+          // TRIVIAL TASK COUNT — also on the event alone, before the re-read. A trace of
+          // one task or none is already one reusable template (goal-host's mintReachedTrace
+          // refuses the same class). Counts every such event, reached or not: the verdict
+          // is not read yet, which is what saves the re-read.
+          const trivial = trivialTaskCountSkip(census?.taskCount, skipRules);
+          if (trivial) {
+            const st = executions.get(gradeId);
+            if (st?.drainTimer) { clearTimeout(st.drainTimer); st.drainTimer = null; }
+            const n = extractionSkips.count(trivial);
+            log.info(`skip ${gradeId} — ${trivial} (taskCount=${census?.taskCount}, producer=${producerId}, skipped=${n}) — re-read avoided`);
+            executions.delete(gradeId);
+            return;
+          }
 
           const REREAD_BACKOFF_MS = [2_000, 8_000, 20_000, 45_000];
           let verdict: "reached" | "not-reached" | "ungraded" = "ungraded";
           let why = "unread";
           let attempts = 0;
+          let rowTags: unknown;
           for (let i = 0; i <= REREAD_BACKOFF_MS.length; i++) {
             if (i > 0) await new Promise((r) => setTimeout(r, REREAD_BACKOFF_MS[i - 1]));
             attempts = i + 1;
@@ -630,6 +655,7 @@ function connectWS() {
               );
               if (traceRes.ok) {
                 const row = await traceRes.json() as { tags?: unknown; reached?: unknown };
+                rowTags = row.tags;
                 const d = reachVerdictFromTraceRow(row);
                 why = d.why;
                 if (d.verdict !== null) { verdict = d.verdict; break; }
@@ -638,6 +664,22 @@ function connectWS() {
               }
             } catch (err: unknown) {
               why = `error:${(err as Error)?.message ?? String(err)}`;
+            }
+          }
+          // PROBE / OBSERVE TAGS — on the durable row, the only place this vessel sees
+          // tags. A probe measures the substrate; it is not work to learn. Counted only
+          // when the run reached, i.e. only when it would otherwise have been extracted.
+          // These skips (and the task-count skip above) lower `Dispatching ribosome-extract`
+          // ON PURPOSE: read the rollback trigger below net of /health extraction_skips.
+          if (verdict === "reached") {
+            const rule = skipTagRule(rowTags, skipRules);
+            if (rule) {
+              const st = executions.get(gradeId);
+              if (st?.drainTimer) { clearTimeout(st.drainTimer); st.drainTimer = null; }
+              const n = extractionSkips.count(`tag:${rule}`);
+              log.info(`skip ${gradeId} — reached but tagged ${rule} (probe/observe run, skipped=${n}) — extraction SKIPPED`);
+              executions.delete(gradeId);
+              return;
             }
           }
           // ROLLBACK TRIGGER — ABSOLUTE, NOT A RATIO. This was formerly "if
@@ -715,6 +757,7 @@ const server = Bun.serve({
         version: VERSION,
         ws_connected: ws?.readyState === WebSocket.OPEN,
         tracked_executions: executions.size,
+        extraction_skips: extractionSkips.snapshot(),
       });
     }
     return new Response("Not Found", { status: 404 });
