@@ -623,7 +623,7 @@ function connectWS() {
             return;
           }
           // TRIVIAL TASK COUNT — also on the event alone, before the re-read. A trace of
-          // one task or none is already one reusable template (goal-host's mintReachedTrace
+          // one task is already one reusable template (goal-host's mintReachedTrace
           // refuses the same class). Counts every such event, reached or not: the verdict
           // is not read yet, which is what saves the re-read.
           const trivial = trivialTaskCountSkip(census?.taskCount, skipRules);
@@ -669,8 +669,10 @@ function connectWS() {
           // PROBE / OBSERVE TAGS — on the durable row, the only place this vessel sees
           // tags. A probe measures the substrate; it is not work to learn. Counted only
           // when the run reached, i.e. only when it would otherwise have been extracted.
-          // These skips (and the task-count skip above) lower `Dispatching ribosome-extract`
-          // ON PURPOSE: read the rollback trigger below net of /health extraction_skips.
+          // These skips lower `Dispatching ribosome-extract` ON PURPOSE, so the rollback
+          // trigger below may be read with /health extraction_skips `tag:*` counts added
+          // back. Never the `task_count<N` count: it is taken before the verdict, over every
+          // event reached or not, so adding it back would overstate what was suppressed.
           if (verdict === "reached") {
             const rule = skipTagRule(rowTags, skipRules);
             if (rule) {

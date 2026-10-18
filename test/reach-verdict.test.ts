@@ -1,5 +1,9 @@
 import { describe, it, expect } from "bun:test";
-import { reachVerdictFromTraceRow } from "../src/index";
+// Through the test loader, not a static import of ../src/index: index.ts binds the vessel port
+// on import, which collides with the live vessel wherever the gate runs (see vessel-module.ts).
+import { vessel } from "./vessel-module";
+
+const { reachVerdictFromTraceRow } = vessel;
 
 // The ribosome extracts templates FROM REACHED EXECUTIONS (law 4). It could not see
 // which executions reached: `reached` is an option<bool> column on `execution`, but the

@@ -28,7 +28,6 @@ describe("probe / observe tag skip (must-fail)", () => {
 
   it("skips a run dispatched in observe mode", () => {
     expect(skipTagRule(["learning_mode:observe"], fallback)).toBe("learning_mode:observe");
-    expect(skipTagRule(["reach_observe:true"], fallback)).toBe("reach_observe:true");
   });
 
   it("CONTROL: an untagged (non-probe) reached multi-task trace is still extracted", () => {
@@ -44,10 +43,9 @@ describe("probe / observe tag skip (must-fail)", () => {
 });
 
 describe("trivial task-count skip (must-fail)", () => {
-  it("skips a 1-task and a 0-task trace", () => {
+  it("skips a 1-task trace", () => {
     expect(MIN_TASK_COUNT_FALLBACK).toBe(2);
     expect(trivialTaskCountSkip(1, fallback)).toBe("task_count<2");
-    expect(trivialTaskCountSkip(0, fallback)).toBe("task_count<2");
   });
 
   it("CONTROL: a 2-task trace is not trivial", () => {
@@ -57,6 +55,8 @@ describe("trivial task-count skip (must-fail)", () => {
   it("an unknown task count is NOT skipped — allow-biased on missing census", () => {
     expect(trivialTaskCountSkip(undefined, fallback)).toBeNull();
     expect(trivialTaskCountSkip(Number.NaN, fallback)).toBeNull();
+    // 0 is how a missing census arrives (onExecutionCompleted treats it as no census), not an empty trace.
+    expect(trivialTaskCountSkip(0, fallback)).toBeNull();
   });
 });
 

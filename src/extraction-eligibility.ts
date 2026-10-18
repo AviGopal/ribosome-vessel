@@ -5,8 +5,10 @@
  *
  * Two skips, each counted by reason:
  *
- *   1. TRIVIAL TASK COUNT. A trace with one task or none is already one reusable
- *      template; extracting it clones the source with a runtime-derived input contract.
+ *   1. TRIVIAL TASK COUNT. A trace with one task is already one reusable template;
+ *      extracting it clones the source with a runtime-derived input contract. A count of
+ *      0 is the census being absent (onExecutionCompleted reads it the same way), not an
+ *      empty trace, so it is not skipped.
  *      goal-host's mintReachedTrace refuses the same class (`tasks.length <= 1`), so this
  *      is the same rule on the vessel's own trigger, not a new one.
  *
@@ -34,7 +36,6 @@ export const SKIP_TAGS_FALLBACK: readonly string[] = Object.freeze([
   // Legacy trend-battery tag, kept while the battery moves to probe:trend-expectation-check.
   "operator:trend-expectation-check",
   "learning_mode:observe",
-  "reach_observe:true",
 ]);
 /** Tag prefixes that mark a trace as not to be extracted. */
 export const SKIP_TAG_PREFIXES_FALLBACK: readonly string[] = Object.freeze(["probe:"]);
@@ -68,12 +69,12 @@ export function skipRulesFromPolicy(pol: Record<string, unknown> | null): SkipRu
 
 /**
  * The trivial-task-count skip. `taskCount` is the durable census off the
- * execution_completed event; when it is absent (an activity-api that predates the
- * census) the count is unknown and the trace is NOT skipped — allow-biased, because a
- * skip on missing data would silently stop extraction outright.
+ * execution_completed event; when it is absent, or 0 (how a missing census arrives),
+ * the count is unknown and the trace is NOT skipped — allow-biased, because a skip on
+ * missing data would silently stop extraction outright.
  */
 export function trivialTaskCountSkip(taskCount: number | undefined, rules: SkipRules): string | null {
-  if (typeof taskCount !== "number" || !Number.isFinite(taskCount)) return null;
+  if (typeof taskCount !== "number" || !Number.isFinite(taskCount) || taskCount < 1) return null;
   return taskCount < rules.minTaskCount ? `task_count<${rules.minTaskCount}` : null;
 }
 
