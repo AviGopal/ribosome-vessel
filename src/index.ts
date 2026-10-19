@@ -15,7 +15,7 @@
 
 import { DiscoveryRegistrationLoop } from "@avigopal/ias-executor-ts";
 import { onTemplateCreated, type ReplayObserverDeps } from "./replay-observer";
-import { SkipCounters, skipRulesFromPolicy, skipTagRule, trivialTaskCountSkip, type SkipRules } from "./extraction-eligibility";
+import { dispatcherAbsentRule, SkipCounters, skipRulesFromPolicy, skipTagReason, skipTagRule, trivialTaskCountSkip, type SkipRules } from "./extraction-eligibility";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Config
@@ -691,20 +691,21 @@ function connectWS() {
               why = `error:${(err as Error)?.message ?? String(err)}`;
             }
           }
-          // PROBE / OBSERVE TAGS — on the durable row, the only place this vessel sees
-          // tags. A probe measures the substrate; it is not work to learn. Counted only
+          // PROBE / OBSERVE / GOAL-HOST-OWNED TAGS — on the durable row, the only place this
+          // vessel sees tags. A probe measures the substrate; it is not work to learn, and a
+          // goal-host trace's mint was already decided by goal-host. Counted only
           // when the run reached, i.e. only when it would otherwise have been extracted.
           // These skips lower `Dispatching ribosome-extract` ON PURPOSE, so the rollback
           // trigger below may be read with /health extraction_skips `tag:*` counts added
           // back. Never the `task_count<N` count: it is taken before the verdict, over every
           // event reached or not, so adding it back would overstate what was suppressed.
           if (verdict === "reached") {
-            const rule = skipTagRule(rowTags, skipRules);
+            const rule = skipTagRule(rowTags, skipRules) ?? dispatcherAbsentRule(rowTags);
             if (rule) {
               const st = executions.get(gradeId);
               if (st?.drainTimer) { clearTimeout(st.drainTimer); st.drainTimer = null; }
               const n = extractionSkips.count(`tag:${rule}`);
-              log.info(`skip ${gradeId} — reached but tagged ${rule} (probe/observe run, skipped=${n}) — extraction SKIPPED`);
+              log.info(`skip ${gradeId} — reached but tagged ${rule} (${skipTagReason(rule)}, skipped=${n}) — extraction SKIPPED`);
               executions.delete(gradeId);
               return;
             }

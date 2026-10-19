@@ -3,7 +3,7 @@
  * decided before any extraction is dispatched. PURE and side-effect free, so it can be
  * pinned by a test without importing index.ts (which binds the vessel port on import).
  *
- * Two skips, each counted by reason:
+ * Three skips, each counted by reason:
  *
  *   1. TRIVIAL TASK COUNT. A trace with one task is already one reusable template;
  *      extracting it clones the source with a runtime-derived input contract. A count of
@@ -20,6 +20,22 @@
  *      it. `learning_mode:observe` is the dispatch's own statement that it must not
  *      teach; extracting from it would teach.
  *
+ *   3. GOAL-HOST-OWNED TRACES (`dispatcher_used:goal-host`). goal-host's reach->mint gate
+ *      (mintReachedTrace) already decides, per reach, whether the run is an extractable
+ *      recipe, and runs ribosome-extract itself when it is. When it refuses (ungrounded,
+ *      credit hold, foreign consumption, defer, depth, trivial) the refusal is a log line
+ *      only, never a field on the trace, so this vessel saw just `reached=true` and
+ *      extracted what goal-host had refused: a constant-SVG emitter and an unbound
+ *      web-search composition, both from judge-only reaches. Extracting a goal-host trace
+ *      here is therefore either a duplicate of goal-host's own mint or an override of its
+ *      refusal. Skipped on the same tag rule as (2); the policy may replace the list.
+ *      FAIL CLOSED when the row names NO dispatcher: goal-host's sync /resolve surface
+ *      walks with no tags at all, so its reached rows carry no `dispatcher_used:*` and
+ *      would otherwise slip past (3). The only other dispatcher that grades reach,
+ *      light-dispatch, stamps `dispatcher_used:light-dispatch`. An absent dispatcher is an
+ *      absent mint decision, so this rule is structural, not a policy field: a policy
+ *      that dropped it would reopen the override of goal-host's refusal.
+ *
  * LAW 1: the threshold and the tag lists are behaviour, so they are read at use time from
  * the shaped `extractionEligibilityPolicy` impulse, the same policy that already carries
  * `ungradableProducers`. The literals below apply only when that policy is absent or a
@@ -31,11 +47,16 @@
 export const MIN_TASK_COUNT_FALLBACK = 2;
 /** Upper bound a policy may set the threshold to; past it the value is treated as malformed. */
 export const MAX_MIN_TASK_COUNT = 10;
+/** The tag goal-host stamps on every trace it dispatches; its reach->mint gate owns those. */
+export const GOAL_HOST_OWNED_TAG = "dispatcher_used:goal-host";
 /** Exact tags that mark a trace as not to be extracted. */
 export const SKIP_TAGS_FALLBACK: readonly string[] = Object.freeze([
   // Legacy trend-battery tag, kept while the battery moves to probe:trend-expectation-check.
   "operator:trend-expectation-check",
   "learning_mode:observe",
+  // goal-host's mintReachedTrace owns the mint decision for its own dispatches, and its
+  // refusal is not persisted on the trace, so a reached goal-host row is not ours to extract.
+  GOAL_HOST_OWNED_TAG,
 ]);
 /** Tag prefixes that mark a trace as not to be extracted. */
 export const SKIP_TAG_PREFIXES_FALLBACK: readonly string[] = Object.freeze(["probe:"]);
@@ -93,6 +114,23 @@ export function skipTagRule(tags: unknown, rules: SkipRules): string | null {
     if (p) return `${p}*`;
   }
   return null;
+}
+
+/** The rule name for a row that carries no `dispatcher_used:*` tag (skip 3, fail closed). */
+export const DISPATCHER_ABSENT_RULE = "dispatcher_used:absent";
+
+/** Skip 3's fail-closed half: no `dispatcher_used:*` tag on the row (or no tags at all). */
+export function dispatcherAbsentRule(tags: unknown): string | null {
+  const hasDispatcher = Array.isArray(tags)
+    && tags.some((t) => typeof t === "string" && t.toLowerCase().startsWith("dispatcher_used:"));
+  return hasDispatcher ? null : DISPATCHER_ABSENT_RULE;
+}
+
+/** Why a matched tag rule skips extraction, for the skip log line a person reads. */
+export function skipTagReason(rule: string): string {
+  if (rule === GOAL_HOST_OWNED_TAG) return "goal-host's reach->mint owns it";
+  if (rule === DISPATCHER_ABSENT_RULE) return "no dispatcher named, so no mint decision to honour; fail closed";
+  return "probe/observe run";
 }
 
 /** Skip counts by reason, served on /health so a skip is observable without the journal. */
