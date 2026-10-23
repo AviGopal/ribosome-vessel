@@ -79,12 +79,21 @@ export function skipRulesFromPolicy(pol: Record<string, unknown> | null): SkipRu
   const fallbacks: string[] = [];
   let minTaskCount = MIN_TASK_COUNT_FALLBACK;
   const m = pol?.minTaskCount;
-  if (typeof m === "number" && Number.isInteger(m) && m >= 1 && m <= MAX_MIN_TASK_COUNT) minTaskCount = m;
-  else fallbacks.push("minTaskCount");
+  if (typeof m === "number" && Number.isInteger(m) && m >= 1 && m <= MAX_MIN_TASK_COUNT) {
+    minTaskCount = m;
+  } else if (pol) {
+    fallbacks.push("minTaskCount");
+  }
   let skipTags = nonEmptyStrings(pol?.skipTags) as readonly string[] | null;
-  if (!skipTags) { skipTags = SKIP_TAGS_FALLBACK; fallbacks.push("skipTags"); }
+  if (!skipTags) {
+    skipTags = SKIP_TAGS_FALLBACK;
+    if (pol) fallbacks.push("skipTags");
+  }
   let skipTagPrefixes = nonEmptyStrings(pol?.skipTagPrefixes) as readonly string[] | null;
-  if (!skipTagPrefixes) { skipTagPrefixes = SKIP_TAG_PREFIXES_FALLBACK; fallbacks.push("skipTagPrefixes"); }
+  if (!skipTagPrefixes) {
+    skipTagPrefixes = SKIP_TAG_PREFIXES_FALLBACK;
+    if (pol) fallbacks.push("skipTagPrefixes");
+  }
   return { minTaskCount, skipTags, skipTagPrefixes, fallbacks };
 }
 
