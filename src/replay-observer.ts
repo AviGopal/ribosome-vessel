@@ -235,7 +235,7 @@ export function buildRelevancePayload(
     activity_variant_id: templateId,
     execution_id: trace.execution_id,
     was_loaded: true,
-    execution_succeeded: judgement.score >= 0.5,
+    execution_succeeded: (trace.success ?? (judgement.score >= 0.5)),
     source: "background_replay",
     replay_trace_id: trace.execution_id,
     replay_weight: weight,
